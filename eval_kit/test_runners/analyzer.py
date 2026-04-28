@@ -19,6 +19,94 @@ logger = logging.getLogger(__name__)
 PASSED_STATUSES = {"PASSED", "XFAIL"}
 FAILED_STATUSES = {"FAILED", "ERROR"}
 
+def _run_before_install_commands(repo_path: Path, pkg_path: Path) -> Optional[str]:
+    """
+    Optional pre-install hook for legacy repos.
+
+    If a repo contains `repo_evaluator_before_install.txt`, run each non-empty, non-comment
+    line as a shell command (in order) before dependency install.
+
+    Notes:
+    - Commands run with cwd=pkg_path (the detected project root / package.json directory).
+    - File is looked up first in pkg_path, then in repo_path.
+    - Enable/disable via env vars:
+        - REPO_EVAL_RUN_BEFORE_INSTALL=0 disables
+        - REPO_EVAL_BEFORE_INSTALL_TIMEOUT_SECONDS (default 180) sets per-command timeout
+        - REPO_EVAL_BEFORE_INSTALL_FILE (default repo_evaluator_before_install.txt)
+    Returns an error string if any command fails, otherwise None.
+    """
+    enabled = os.environ.get("REPO_EVAL_RUN_BEFORE_INSTALL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "n",
+    )
+    if not enabled:
+        return None
+
+    filename = os.environ.get(
+        "REPO_EVAL_BEFORE_INSTALL_FILE", "repo_evaluator_before_install.txt"
+    ).strip()
+    if not filename:
+        return None
+
+    cfg_candidates = [pkg_path / filename, repo_path / filename]
+    cfg = next((p for p in cfg_candidates if p.exists()), None)
+    if not cfg:
+        return None
+
+    try:
+        timeout_s = int(
+            os.environ.get("REPO_EVAL_BEFORE_INSTALL_TIMEOUT_SECONDS", "180").strip()
+        )
+    except Exception:
+        timeout_s = 180
+
+    try:
+        lines = cfg.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        return f"Failed to read {cfg}: {e}"
+
+    commands: List[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        commands.append(s)
+
+    if not commands:
+        return None
+
+    logger.info(f"Running before-install commands from {cfg} (cwd={pkg_path})...")
+    for i, cmd in enumerate(commands, 1):
+        logger.info(f"    [{i}/{len(commands)}] {cmd}")
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=pkg_path,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Before-install command timed out after {timeout_s}s: {cmd}"
+        except Exception as e:
+            return f"Before-install command failed to start: {cmd}\n{e}"
+
+        if result.returncode != 0:
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+            tail = "\n".join([x for x in [stdout, stderr] if x][-80:])
+            return (
+                "Before-install command failed:\n"
+                f"cmd: {cmd}\n"
+                f"exit: {result.returncode}\n"
+                f"output:\n{tail}"
+            )
+
+    return None
+
 INSTALL_INSTRUCTIONS = {
     "pytest": "Install Python: https://python.org/downloads/ or 'sudo apt install python3' / 'brew install python'",
     "unittest": "Install Python: https://python.org/downloads/ or 'sudo apt install python3' / 'brew install python'",
@@ -976,6 +1064,13 @@ class F2PP2PAnalyzer:
                 self._apply_test_files_from_head(
                     apply_test_files, head_sha, base_sha=sha
                 )
+
+        before_install_err = _run_before_install_commands(
+            repo_path=self.repo_path, pkg_path=pkg_path
+        )
+        if before_install_err:
+            logger.error(before_install_err)
+            return TestResult(error=before_install_err)
 
         logger.info(f"Installing dependencies at {label} ({sha[:8]}) in {pkg_path}...")
         try:
