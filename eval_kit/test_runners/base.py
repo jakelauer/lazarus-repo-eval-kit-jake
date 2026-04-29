@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 import subprocess
 import shutil
+import time
+import selectors
+import sys
 
 
 @dataclass
@@ -269,15 +272,100 @@ class TestRunner(ABC):
             full_env.update(env)
 
         try:
-            result = subprocess.run(
+            stream = os.environ.get("REPO_EVAL_STREAM_TEST_OUTPUT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            )
+            if not stream:
+                result = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=full_env,
+                )
+                return result.returncode, result.stdout, result.stderr
+
+            # Stream stdout/stderr live (helpful for debugging hangs) while still capturing.
+            proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
+                bufsize=1,
                 env=full_env,
             )
-            return result.returncode, result.stdout, result.stderr
+
+            sel = selectors.DefaultSelector()
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+            sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+            sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+            out_chunks: List[str] = []
+            err_chunks: List[str] = []
+            start = time.time()
+
+            while True:
+                # Timeout check
+                if timeout is not None and (time.time() - start) > timeout:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise TestTimeoutError(
+                        f"Command timed out after {timeout}s: {' '.join(cmd)}"
+                    )
+
+                if proc.poll() is not None:
+                    # Drain any remaining output
+                    while True:
+                        events = sel.select(timeout=0)
+                        if not events:
+                            break
+                        for key, _ in events:
+                            stream_name = key.data
+                            line = key.fileobj.readline()
+                            if not line:
+                                try:
+                                    sel.unregister(key.fileobj)
+                                except Exception:
+                                    pass
+                                continue
+                            if stream_name == "stdout":
+                                out_chunks.append(line)
+                                sys.stdout.write(line)
+                                sys.stdout.flush()
+                            else:
+                                err_chunks.append(line)
+                                sys.stderr.write(line)
+                                sys.stderr.flush()
+                    break
+
+                events = sel.select(timeout=0.2)
+                for key, _ in events:
+                    stream_name = key.data
+                    line = key.fileobj.readline()
+                    if not line:
+                        try:
+                            sel.unregister(key.fileobj)
+                        except Exception:
+                            pass
+                        continue
+                    if stream_name == "stdout":
+                        out_chunks.append(line)
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    else:
+                        err_chunks.append(line)
+                        sys.stderr.write(line)
+                        sys.stderr.flush()
+
+            return proc.returncode or 0, "".join(out_chunks), "".join(err_chunks)
         except subprocess.TimeoutExpired:
             raise TestTimeoutError(
                 f"Command timed out after {timeout}s: {' '.join(cmd)}"
