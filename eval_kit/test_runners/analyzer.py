@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 PASSED_STATUSES = {"PASSED", "XFAIL"}
 FAILED_STATUSES = {"FAILED", "ERROR"}
 
+def _before_nonzero_policy() -> str:
+    """
+    Policy for handling BEFORE-stage runs that exit non-zero but collect 0 tests.
+
+    This commonly happens when the test suite fails to load (e.g. TypeScript compile error via ts-node).
+
+    Values (env: REPO_EVAL_BEFORE_NONZERO_POLICY):
+    - "reject" (default): reject PR with TEST_EXIT_NONZERO (current behavior)
+    - "ignore": do not reject; proceed with empty BEFORE results (may affect F2P/P2P validity)
+    - "mirror_base_and_fail_new": do not reject; later synthesize BEFORE statuses by:
+        - mirroring BASE statuses for tests that existed in BASE, and
+        - marking tests only seen in AFTER as FAILED in BEFORE.
+    """
+    raw = os.environ.get("REPO_EVAL_BEFORE_NONZERO_POLICY", "reject").strip().lower()
+    if raw in ("reject", "ignore", "mirror_base_and_fail_new"):
+        return raw
+    return "reject"
+
 def _run_before_install_commands(repo_path: Path, pkg_path: Path) -> Optional[str]:
     """
     Optional pre-install hook for legacy repos.
@@ -475,6 +493,7 @@ class F2PP2PAnalyzer:
         errors = []
         packages_tested = 0
         packages_no_runner = []
+        before_inconclusive = False
 
         for pkg_path in affected_packages:
             pkg_name = (
@@ -521,7 +540,13 @@ class F2PP2PAnalyzer:
 
             # Run 1: tests_base (pristine base)
             logger.info(f"  [1/3] Checking out base (pristine): {base_sha[:8]}")
-            base_result = self._run_at_commit(base_sha, "base", runner, pkg_path)
+            base_result = self._run_at_commit(
+                base_sha,
+                "base",
+                runner,
+                pkg_path,
+                selected_test_files=pkg_test_files,
+            )
             if base_result.error and "checkout" in base_result.error.lower():
                 errors.append(f"{pkg_name} base: {base_result.error}")
                 continue
@@ -562,6 +587,7 @@ class F2PP2PAnalyzer:
                 pkg_path,
                 apply_test_files=pkg_test_files,
                 head_sha=head_sha,
+                selected_test_files=pkg_test_files,
             )
             if before_result.error and "checkout" in before_result.error.lower():
                 errors.append(f"{pkg_name} before: {before_result.error}")
@@ -588,11 +614,28 @@ class F2PP2PAnalyzer:
                 and not before_result.passed
                 and not before_result.failed
             ):
-                result.tests_base = base_result
-                result.tests_before = before_result
-                result.error = f"{pkg_name} before: tests exited with code {before_result.exit_code}"
-                result.error_code = "TEST_EXIT_NONZERO"
-                return result
+                policy = _before_nonzero_policy()
+                if policy == "reject":
+                    result.tests_base = base_result
+                    result.tests_before = before_result
+                    result.error = (
+                        f"{pkg_name} before: tests exited with code {before_result.exit_code}"
+                    )
+                    result.error_code = "TEST_EXIT_NONZERO"
+                    return result
+                elif policy == "ignore":
+                    logger.warning(
+                        f"  ⚠️  BEFORE stage exited non-zero with 0 collected tests "
+                        f"(exit={before_result.exit_code}). Proceeding due to "
+                        f"REPO_EVAL_BEFORE_NONZERO_POLICY=ignore."
+                    )
+                elif policy == "mirror_base_and_fail_new":
+                    before_inconclusive = True
+                    logger.warning(
+                        f"  ⚠️  BEFORE stage exited non-zero with 0 collected tests "
+                        f"(exit={before_result.exit_code}). Proceeding due to "
+                        f"REPO_EVAL_BEFORE_NONZERO_POLICY=mirror_base_and_fail_new."
+                    )
 
             # Run 3: tests_after (full head commit)
             after_use_apply = os.environ.get(
@@ -609,6 +652,7 @@ class F2PP2PAnalyzer:
                     pkg_path,
                     head_sha=head_sha,
                     apply_full_patch=True,
+                    selected_test_files=pkg_test_files,
                 )
             # NOTE: Disabled non-patch AFTER path. We always want base checkout + patch apply.
             # else:
@@ -688,6 +732,19 @@ class F2PP2PAnalyzer:
             failed=[t for t, s in all_tests_after.items() if s == "FAILED"],
             skipped=[t for t, s in all_tests_after.items() if s == "SKIPPED"],
         )
+
+        # If BEFORE was inconclusive (non-zero exit with 0 collected tests), optionally synthesize
+        # a BEFORE status map so F2P/P2P can still be computed in a stable way.
+        #
+        # This is primarily intended for TS projects where new tests may not compile against base.
+        if before_inconclusive and _before_nonzero_policy() == "mirror_base_and_fail_new":
+            # Mirror BASE statuses for any test names that existed in BASE.
+            for test_name, status in all_tests_base.items():
+                all_tests_before.setdefault(test_name, status)
+            # For tests only seen in AFTER, mark them as FAILED in BEFORE.
+            for test_name in all_tests_after.keys():
+                if test_name not in all_tests_base:
+                    all_tests_before.setdefault(test_name, "FAILED")
 
         # Preserve stage-level exit codes/errors (otherwise stage summaries can look "healthy"
         # even when most suites fail to load and produce 0 assertions).
@@ -1031,6 +1088,7 @@ class F2PP2PAnalyzer:
         apply_test_files: Optional[List[str]] = None,
         head_sha: Optional[str] = None,
         apply_full_patch: bool = False,
+        selected_test_files: Optional[List[str]] = None,
     ) -> TestResult:
         try:
             self._git_checkout(sha)
@@ -1065,6 +1123,21 @@ class F2PP2PAnalyzer:
                     apply_test_files, head_sha, base_sha=sha
                 )
 
+        # For repos that keep test config at repo root (e.g. root `.mocharc.js`),
+        # running mocha from a subdirectory can cause config/test discovery issues.
+        # Heuristic: if we're in a JS runner and the repo root looks like the true
+        # project root, prefer it as the working directory.
+        try:
+            if (
+                getattr(runner, "language", "") == "JavaScript"
+                and pkg_path != self.repo_path
+                and (self.repo_path / "package.json").exists()
+                and (self.repo_path / ".mocharc.js").exists()
+            ):
+                pkg_path = self.repo_path
+        except Exception:
+            pass
+
         before_install_err = _run_before_install_commands(
             repo_path=self.repo_path, pkg_path=pkg_path
         )
@@ -1089,7 +1162,32 @@ class F2PP2PAnalyzer:
 
         logger.info(f"Running tests at {label} ({sha[:8]}) in {pkg_path}...")
         try:
-            result = runner.run_tests(pkg_path, timeout=self.test_timeout)
+            # If we know which test files changed in the PR, run only those files for F2P/P2P.
+            # This avoids monorepos / large suites where unrelated tests break at historical commits.
+            old_json = os.environ.get("REPO_EVAL_JS_TEST_FILES_JSON")
+            old_txt = os.environ.get("REPO_EVAL_JS_TEST_FILES")
+            try:
+                if selected_test_files:
+                    # Use JSON form to avoid escaping issues.
+                    import json as _json
+
+                    os.environ["REPO_EVAL_JS_TEST_FILES_JSON"] = _json.dumps(
+                        [str(x) for x in selected_test_files]
+                    )
+                else:
+                    os.environ.pop("REPO_EVAL_JS_TEST_FILES_JSON", None)
+                    os.environ.pop("REPO_EVAL_JS_TEST_FILES", None)
+
+                result = runner.run_tests(pkg_path, timeout=self.test_timeout)
+            finally:
+                if old_json is None:
+                    os.environ.pop("REPO_EVAL_JS_TEST_FILES_JSON", None)
+                else:
+                    os.environ["REPO_EVAL_JS_TEST_FILES_JSON"] = old_json
+                if old_txt is None:
+                    os.environ.pop("REPO_EVAL_JS_TEST_FILES", None)
+                else:
+                    os.environ["REPO_EVAL_JS_TEST_FILES"] = old_txt
             if result.exit_code is None:
                 inferred = _infer_exit_code(result)
                 print(f"inferred exit code: {inferred}")

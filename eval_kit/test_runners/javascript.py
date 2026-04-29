@@ -53,6 +53,35 @@ def _load_test_env(project_root: Path) -> dict:
     return env
 
 
+def _load_selected_test_files(project_root: Path) -> List[str]:
+    """
+    Load an optional list of test file paths to run (relative to project_root).
+
+    Priority:
+    1) REPO_EVAL_JS_TEST_FILES_JSON: JSON array of strings
+    2) REPO_EVAL_JS_TEST_FILES: newline-separated or comma-separated list
+    """
+    raw_json = os.getenv("REPO_EVAL_JS_TEST_FILES_JSON", "").strip()
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            return []
+
+    raw = os.getenv("REPO_EVAL_JS_TEST_FILES", "").strip()
+    if not raw:
+        return []
+
+    # Allow either comma-separated or newline-separated.
+    if "\n" in raw:
+        parts = [ln.strip() for ln in raw.splitlines()]
+    else:
+        parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p and not p.startswith("#")]
+
+
 def _load_write_empty_json_files(project_root: Path) -> List[str]:
     """
     Load a list of JSON files to create (with `{}`) if missing.
@@ -74,6 +103,27 @@ def _load_write_empty_json_files(project_root: Path) -> List[str]:
             return []
 
     return []
+
+def _is_runnable_mocha_test_path(path_str: str) -> bool:
+    """
+    Mocha will attempt to `require()` each positional arg. If we pass non-JS assets
+    (e.g. YAML, snapshots, fixtures), Mocha will crash before running any tests.
+    """
+    p = Path(str(path_str))
+    # If it has no suffix, assume it's a directory/glob-like and let Mocha config handle it.
+    # (We avoid passing such values from selected files anyway.)
+    if not p.suffix:
+        return False
+    return p.suffix.lower() in {
+        ".js",
+        ".cjs",
+        ".mjs",
+        ".jsx",
+        ".ts",
+        ".cts",
+        ".mts",
+        ".tsx",
+    }
 
 
 def detect_package_manager(repo_path: Path) -> str:
@@ -878,18 +928,89 @@ class MochaRunner(TestRunner):
             json_path = Path(f.name)
 
         try:
+            # Env defaults and optional config:
+            # - Always inject CI=true (safe default)
+            # - Optionally read REPO_EVAL_TEST_ENV_JSON OR repo_evaluator_test_env.json
+            test_env: dict = _load_test_env(project_root)
+
+            # Optional: run only specific test files (paths relative to project_root).
+            selected_files = _load_selected_test_files(project_root)
+            selected_args: List[str] = []
+            for rel in selected_files:
+                try:
+                    # If caller provided absolute paths, normalize to relpath when possible.
+                    p = Path(rel)
+                    if p.is_absolute():
+                        try:
+                            rel = str(p.relative_to(project_root))
+                        except Exception:
+                            rel = str(p)
+                    # Prefer running files that exist; skip missing.
+                    candidate = (
+                        (project_root / rel) if not Path(rel).is_absolute() else Path(rel)
+                    )
+                    if (
+                        candidate.exists()
+                        and candidate.is_file()
+                        and _is_runnable_mocha_test_path(str(candidate))
+                    ):
+                        selected_args.append(str(candidate))
+                except Exception:
+                    continue
+
+            # Optional: additional mocha requires (comma-separated or newline-separated).
+            # Useful for preloading mocks to disable external services (DB, network, etc).
+            raw_requires = os.getenv("REPO_EVAL_MOCHA_REQUIRE", "").strip()
+            require_args: List[str] = []
+            if raw_requires:
+                parts = (
+                    [ln.strip() for ln in raw_requires.splitlines()]
+                    if "\n" in raw_requires
+                    else [p.strip() for p in raw_requires.split(",")]
+                )
+                for p in [x for x in parts if x and not x.startswith("#")]:
+                    try:
+                        rp = Path(p)
+                        if not rp.is_absolute():
+                            rp = project_root / p
+                        if rp.exists():
+                            require_args += ["--require", str(rp)]
+                    except Exception:
+                        continue
+
             cmd = run_cmd + [
                 "mocha",
+                *require_args,
                 "--reporter",
                 "json",
                 "--reporter-option",
                 f"output={json_path}",
+                *selected_args,
             ]
 
             returncode, stdout, stderr = self._run_command(
-                cmd, project_root, timeout=timeout
+                cmd, project_root, timeout=timeout, env=test_env
             )
             output = stdout + "\n" + stderr
+
+            # Compatibility: some older mocha versions don't support --reporter-option.
+            # If we see that, rerun without it and parse JSON from stdout.
+            if "unknown option `--reporter-option`" in output or "unknown option '--reporter-option'" in output:
+                cmd2 = run_cmd + ["mocha", "--reporter", "json", *selected_args]
+                returncode2, stdout2, stderr2 = self._run_command(
+                    cmd2, project_root, timeout=timeout, env=test_env
+                )
+                output2 = stdout2 + "\n" + stderr2
+                try:
+                    data2 = json.loads(stdout2)
+                    result2 = self._parse_mocha_stdout(data2, output2)
+                    result2.exit_code = returncode2
+                    return result2
+                except json.JSONDecodeError:
+                    result2 = TestResult(raw_output=output2, exit_code=returncode2)
+                    if returncode2 != 0:
+                        result2.error = f"Mocha failed with exit code {returncode2}"
+                    return result2
 
             # Try to parse JSON output file
             if json_path.exists() and json_path.stat().st_size > 0:
